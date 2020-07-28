@@ -17,7 +17,6 @@ limitations under the License.
 package network
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -34,6 +33,8 @@ import (
 
 	compute "google.golang.org/api/compute/v1"
 
+	"k8s.io/client-go/tools/cache"
+
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -42,7 +43,9 @@ import (
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
+	watch "k8s.io/apimachinery/pkg/watch"
 	clientset "k8s.io/client-go/kubernetes"
+	watchtools "k8s.io/client-go/tools/watch"
 	cloudprovider "k8s.io/cloud-provider"
 	"k8s.io/kubernetes/test/e2e/framework"
 	e2edeployment "k8s.io/kubernetes/test/e2e/framework/deployment"
@@ -101,42 +104,81 @@ var (
 // portsByPodName is a map that maps pod name to container ports.
 type portsByPodName map[string][]int
 
+// affinityCheckFromPod returns interval, timeout and function pinging the service and
+// returning pinged hosts for pinging the service from execPod.
+func affinityCheckFromPod(execPod *v1.Pod, serviceIP string, servicePort int) (time.Duration, time.Duration, func() []string) {
+	timeout := AffinityTimeout
+	// interval considering a maximum of 2 seconds per connection
+	interval := 2 * AffinityConfirmCount * time.Second
+
+	serviceIPPort := net.JoinHostPort(serviceIP, strconv.Itoa(servicePort))
+	curl := fmt.Sprintf(`curl -q -s --connect-timeout 2 http://%s/`, serviceIPPort)
+	cmd := fmt.Sprintf("for i in $(seq 0 %d); do echo; %s ; done", AffinityConfirmCount, curl)
+	getHosts := func() []string {
+		stdout, err := framework.RunHostCmd(execPod.Namespace, execPod.Name, cmd)
+		if err != nil {
+			framework.Logf("Failed to get response from %s. Retry until timeout", serviceIPPort)
+			return nil
+		}
+		return strings.Split(stdout, "\n")
+	}
+
+	return interval, timeout, getHosts
+}
+
+// affinityCheckFromTest returns interval, timeout and function pinging the service and
+// returning pinged hosts for pinging the service from the test itself.
+func affinityCheckFromTest(cs clientset.Interface, serviceIP string, servicePort int) (time.Duration, time.Duration, func() []string) {
+	interval := 2 * time.Second
+	timeout := e2eservice.GetServiceLoadBalancerPropagationTimeout(cs)
+
+	params := &e2enetwork.HTTPPokeParams{Timeout: 2 * time.Second}
+	getHosts := func() []string {
+		var hosts []string
+		for i := 0; i < AffinityConfirmCount; i++ {
+			result := e2enetwork.PokeHTTP(serviceIP, servicePort, "", params)
+			if result.Status == e2enetwork.HTTPSuccess {
+				hosts = append(hosts, string(result.Body))
+			}
+		}
+		return hosts
+	}
+
+	return interval, timeout, getHosts
+}
+
 // CheckAffinity function tests whether the service affinity works as expected.
 // If affinity is expected, the test will return true once affinityConfirmCount
 // number of same response observed in a row. If affinity is not expected, the
 // test will keep observe until different responses observed. The function will
 // return false only in case of unexpected errors.
 func checkAffinity(cs clientset.Interface, execPod *v1.Pod, serviceIP string, servicePort int, shouldHold bool) bool {
-	serviceIPPort := net.JoinHostPort(serviceIP, strconv.Itoa(servicePort))
-	curl := fmt.Sprintf(`curl -q -s --connect-timeout 2 http://%s/`, serviceIPPort)
-	cmd := fmt.Sprintf("for i in $(seq 0 %d); do echo; %s ; done", AffinityConfirmCount, curl)
-	timeout := AffinityTimeout
-	if execPod == nil {
-		timeout = e2eservice.GetServiceLoadBalancerPropagationTimeout(cs)
+	var interval, timeout time.Duration
+	var getHosts func() []string
+	if execPod != nil {
+		interval, timeout, getHosts = affinityCheckFromPod(execPod, serviceIP, servicePort)
+	} else {
+		interval, timeout, getHosts = affinityCheckFromTest(cs, serviceIP, servicePort)
 	}
+
 	var tracker affinityTracker
-	// interval considering a maximum of 2 seconds per connection
-	interval := 2 * AffinityConfirmCount * time.Second
 	if pollErr := wait.PollImmediate(interval, timeout, func() (bool, error) {
-		if execPod != nil {
-			stdout, err := framework.RunHostCmd(execPod.Namespace, execPod.Name, cmd)
-			if err != nil {
-				framework.Logf("Failed to get response from %s. Retry until timeout", serviceIPPort)
-				return false, nil
-			}
-			hosts := strings.Split(stdout, "\n")
-			for _, host := range hosts {
+		hosts := getHosts()
+		for _, host := range hosts {
+			if len(host) > 0 {
 				tracker.recordHost(strings.TrimSpace(host))
 			}
-		} else {
-			rawResponse := GetHTTPContent(serviceIP, servicePort, timeout, "")
-			tracker.recordHost(rawResponse.String())
 		}
+
 		trackerFulfilled, affinityHolds := tracker.checkHostTrace(AffinityConfirmCount)
+		if !trackerFulfilled {
+			return false, nil
+		}
+
 		if !shouldHold && !affinityHolds {
 			return true, nil
 		}
-		if shouldHold && trackerFulfilled && affinityHolds {
+		if shouldHold && affinityHolds {
 			return true, nil
 		}
 		return false, nil
@@ -147,7 +189,7 @@ func checkAffinity(cs clientset.Interface, execPod *v1.Pod, serviceIP string, se
 			return false
 		}
 		if !trackerFulfilled {
-			checkAffinityFailed(tracker, fmt.Sprintf("Connection to %s timed out or not enough responses.", serviceIPPort))
+			checkAffinityFailed(tracker, fmt.Sprintf("Connection timed out or not enough responses."))
 		}
 		if shouldHold {
 			checkAffinityFailed(tracker, "Affinity should hold but didn't.")
@@ -615,6 +657,32 @@ func testHTTPHealthCheckNodePort(ip string, port int, request string) (bool, err
 	return false, fmt.Errorf("unexpected HTTP response code %s from health check responder at %s", resp.Status, url)
 }
 
+func testHTTPHealthCheckNodePortFromTestContainer(config *e2enetwork.NetworkingTestConfig, host string, port int, timeout time.Duration, expectSucceed bool, threshold int) error {
+	count := 0
+	pollFn := func() (bool, error) {
+		statusCode, err := config.GetHTTPCodeFromTestContainer(
+			"/healthz",
+			host,
+			port)
+		if err != nil {
+			framework.Logf("Got error reading status code from http://%s:%d/healthz via test container: %v", host, port, err)
+			return false, nil
+		}
+		framework.Logf("Got status code from http://%s:%d/healthz via test container: %d", host, port, statusCode)
+		success := statusCode == 200
+		if (success && expectSucceed) ||
+			(!success && !expectSucceed) {
+			count++
+		}
+		return count >= threshold, nil
+	}
+	err := wait.PollImmediate(time.Second, timeout, pollFn)
+	if err != nil {
+		return fmt.Errorf("error waiting for healthCheckNodePort: expected at least %d succeed=%v on %v:%v/healthz, got %d", threshold, expectSucceed, host, port, count)
+	}
+	return nil
+}
+
 // Does an HTTP GET, but does not reuse TCP connections
 // This masks problems where the iptables rule has changed, but we don't see it
 func httpGetNoConnectionPoolTimeout(url string, timeout time.Duration) (*http.Response, error) {
@@ -681,6 +749,23 @@ func waitForApiserverUp(c clientset.Interface) error {
 		}
 	}
 	return fmt.Errorf("waiting for apiserver timed out")
+}
+
+// getEndpointNodesWithInternalIP returns a map of nodenames:internal-ip on which the
+// endpoints of the Service are running.
+func getEndpointNodesWithInternalIP(jig *e2eservice.TestJig) (map[string]string, error) {
+	nodesWithIPs, err := jig.GetEndpointNodesWithIP(v1.NodeInternalIP)
+	if err != nil {
+		return nil, err
+	}
+	endpointsNodeMap := make(map[string]string, len(nodesWithIPs))
+	for nodeName, internalIPs := range nodesWithIPs {
+		if len(internalIPs) < 1 {
+			return nil, fmt.Errorf("no internal ip found for node %s", nodeName)
+		}
+		endpointsNodeMap[nodeName] = internalIPs[0]
+	}
+	return endpointsNodeMap, nil
 }
 
 var _ = SIGDescribe("Services", func() {
@@ -2728,16 +2813,13 @@ var _ = SIGDescribe("Services", func() {
 	})
 
 	ginkgo.It("should test the lifecycle of an Endpoint", func() {
-		ns := f.Namespace.Name
+		testNamespaceName := f.Namespace.Name
 		testEndpointName := "testservice"
-
-		ginkgo.By("creating an Endpoint")
-		_, err := f.ClientSet.CoreV1().Endpoints(ns).Create(context.TODO(), &v1.Endpoints{
+		testEndpoints := v1.Endpoints{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      testEndpointName,
-				Namespace: ns,
+				Name: testEndpointName,
 				Labels: map[string]string{
-					"testendpoint-static": "true",
+					"test-endpoint-static": "true",
 				},
 			},
 			Subsets: []v1.EndpointSubset{{
@@ -2750,50 +2832,82 @@ var _ = SIGDescribe("Services", func() {
 					Protocol: v1.ProtocolTCP,
 				}},
 			}},
-		}, metav1.CreateOptions{})
-		framework.ExpectNoError(err, "failed to create Endpoint")
-
-		// set up a watch for the Endpoint
-		// this timeout was chosen as there was timeout failure from the CI
-		endpointWatchTimeoutSeconds := int64(180)
-		endpointWatch, err := f.ClientSet.CoreV1().Endpoints(ns).Watch(context.TODO(), metav1.ListOptions{LabelSelector: "testendpoint-static=true", TimeoutSeconds: &endpointWatchTimeoutSeconds})
-		framework.ExpectNoError(err, "failed to setup watch on newly created Endpoint")
-		endpointWatchChan := endpointWatch.ResultChan()
-		ginkgo.By("waiting for available Endpoint")
-		for watchEvent := range endpointWatchChan {
-			if watchEvent.Type == "ADDED" {
-				break
-			}
 		}
+		w := &cache.ListWatch{
+			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+				options.LabelSelector = "test-endpoint-static=true"
+				return f.ClientSet.CoreV1().Endpoints(testNamespaceName).Watch(context.TODO(), options)
+			},
+		}
+		endpointsList, err := f.ClientSet.CoreV1().Endpoints("").List(context.TODO(), metav1.ListOptions{LabelSelector: "test-endpoint-static=true"})
+		framework.ExpectNoError(err, "failed to list Endpoints")
+
+		ginkgo.By("creating an Endpoint")
+		_, err = f.ClientSet.CoreV1().Endpoints(testNamespaceName).Create(context.TODO(), &testEndpoints, metav1.CreateOptions{})
+		framework.ExpectNoError(err, "failed to create Endpoint")
+		ginkgo.By("waiting for available Endpoint")
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, err = watchtools.Until(ctx, endpointsList.ResourceVersion, w, func(event watch.Event) (bool, error) {
+			switch event.Type {
+			case watch.Added:
+				if endpoints, ok := event.Object.(*v1.Endpoints); ok {
+					found := endpoints.ObjectMeta.Name == endpoints.Name &&
+						endpoints.Labels["test-endpoint-static"] == "true"
+					return found, nil
+				}
+			default:
+				framework.Logf("observed event type %v", event.Type)
+			}
+			return false, nil
+		})
+		framework.ExpectNoError(err, "failed to see %v event", watch.Added)
 
 		ginkgo.By("listing all Endpoints")
-		endpointsList, err := f.ClientSet.CoreV1().Endpoints("").List(context.TODO(), metav1.ListOptions{LabelSelector: "testendpoint-static=true"})
+		endpointsList, err = f.ClientSet.CoreV1().Endpoints("").List(context.TODO(), metav1.ListOptions{LabelSelector: "test-endpoint-static=true"})
 		framework.ExpectNoError(err, "failed to list Endpoints")
-		foundEndpointService := false
+		eventFound := false
 		var foundEndpoint v1.Endpoints
 		for _, endpoint := range endpointsList.Items {
-			if endpoint.ObjectMeta.Name == testEndpointName && endpoint.ObjectMeta.Namespace == ns {
-				foundEndpointService = true
+			if endpoint.ObjectMeta.Name == testEndpointName && endpoint.ObjectMeta.Namespace == testNamespaceName {
+				eventFound = true
 				foundEndpoint = endpoint
 				break
 			}
 		}
-		framework.ExpectEqual(foundEndpointService, true, "unable to find Endpoint Service in list of Endpoints")
+		framework.ExpectEqual(eventFound, true, "unable to find Endpoint Service in list of Endpoints")
 
 		ginkgo.By("updating the Endpoint")
-		foundEndpoint.ObjectMeta.Labels["testservice"] = "first-modification"
-		_, err = f.ClientSet.CoreV1().Endpoints(ns).Update(context.TODO(), &foundEndpoint, metav1.UpdateOptions{})
+		foundEndpoint.ObjectMeta.Labels["test-service"] = "updated"
+		_, err = f.ClientSet.CoreV1().Endpoints(testNamespaceName).Update(context.TODO(), &foundEndpoint, metav1.UpdateOptions{})
 		framework.ExpectNoError(err, "failed to update Endpoint with new label")
 
+		ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, err = watchtools.Until(ctx, endpointsList.ResourceVersion, w, func(event watch.Event) (bool, error) {
+			switch event.Type {
+			case watch.Modified:
+				if endpoints, ok := event.Object.(*v1.Endpoints); ok {
+					found := endpoints.ObjectMeta.Name == endpoints.Name &&
+						endpoints.Labels["test-endpoint-static"] == "true"
+					return found, nil
+				}
+			default:
+				framework.Logf("observed event type %v", event.Type)
+			}
+			return false, nil
+		})
+		framework.ExpectNoError(err, "failed to see %v event", watch.Modified)
+
 		ginkgo.By("fetching the Endpoint")
-		_, err = f.ClientSet.CoreV1().Endpoints(ns).Get(context.TODO(), testEndpointName, metav1.GetOptions{})
+		endpoints, err := f.ClientSet.CoreV1().Endpoints(testNamespaceName).Get(context.TODO(), testEndpointName, metav1.GetOptions{})
 		framework.ExpectNoError(err, "failed to fetch Endpoint")
-		framework.ExpectEqual(foundEndpoint.ObjectMeta.Labels["testservice"], "first-modification", "label not patched")
+		framework.ExpectEqual(foundEndpoint.ObjectMeta.Labels["test-service"], "updated", "failed to update Endpoint %v in namespace %v label not updated", testEndpointName, testNamespaceName)
 
 		endpointPatch, err := json.Marshal(map[string]interface{}{
 			"metadata": map[string]interface{}{
 				"labels": map[string]string{
-					"testservice": "second-modification",
+					"test-service": "patched",
 				},
 			},
 			"subsets": []map[string]interface{}{
@@ -2814,14 +2928,30 @@ var _ = SIGDescribe("Services", func() {
 		})
 		framework.ExpectNoError(err, "failed to marshal JSON for WatchEvent patch")
 		ginkgo.By("patching the Endpoint")
-		_, err = f.ClientSet.CoreV1().Endpoints(ns).Patch(context.TODO(), testEndpointName, types.StrategicMergePatchType, []byte(endpointPatch), metav1.PatchOptions{})
+		_, err = f.ClientSet.CoreV1().Endpoints(testNamespaceName).Patch(context.TODO(), testEndpointName, types.StrategicMergePatchType, []byte(endpointPatch), metav1.PatchOptions{})
 		framework.ExpectNoError(err, "failed to patch Endpoint")
+		ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, err = watchtools.Until(ctx, endpoints.ResourceVersion, w, func(event watch.Event) (bool, error) {
+			switch event.Type {
+			case watch.Modified:
+				if endpoints, ok := event.Object.(*v1.Endpoints); ok {
+					found := endpoints.ObjectMeta.Name == endpoints.Name &&
+						endpoints.Labels["test-endpoint-static"] == "true"
+					return found, nil
+				}
+			default:
+				framework.Logf("observed event type %v", event.Type)
+			}
+			return false, nil
+		})
+		framework.ExpectNoError(err, "failed to see %v event", watch.Modified)
 
 		ginkgo.By("fetching the Endpoint")
-		endpoint, err := f.ClientSet.CoreV1().Endpoints(ns).Get(context.TODO(), testEndpointName, metav1.GetOptions{})
+		endpoints, err = f.ClientSet.CoreV1().Endpoints(testNamespaceName).Get(context.TODO(), testEndpointName, metav1.GetOptions{})
 		framework.ExpectNoError(err, "failed to fetch Endpoint")
-		framework.ExpectEqual(endpoint.ObjectMeta.Labels["testservice"], "second-modification", "failed to patch Endpoint with Label")
-		endpointSubsetOne := endpoint.Subsets[0]
+		framework.ExpectEqual(endpoints.ObjectMeta.Labels["test-service"], "patched", "failed to patch Endpoint with Label")
+		endpointSubsetOne := endpoints.Subsets[0]
 		endpointSubsetOneAddresses := endpointSubsetOne.Addresses[0]
 		endpointSubsetOnePorts := endpointSubsetOne.Ports[0]
 		framework.ExpectEqual(endpointSubsetOneAddresses.IP, "10.0.0.25", "failed to patch Endpoint")
@@ -2829,15 +2959,30 @@ var _ = SIGDescribe("Services", func() {
 		framework.ExpectEqual(endpointSubsetOnePorts.Port, int32(8080), "failed to patch Endpoint")
 
 		ginkgo.By("deleting the Endpoint by Collection")
-		err = f.ClientSet.CoreV1().Endpoints(ns).DeleteCollection(context.TODO(), metav1.DeleteOptions{}, metav1.ListOptions{LabelSelector: "testendpoint-static=true"})
+		err = f.ClientSet.CoreV1().Endpoints(testNamespaceName).DeleteCollection(context.TODO(), metav1.DeleteOptions{}, metav1.ListOptions{LabelSelector: "test-endpoint-static=true"})
 		framework.ExpectNoError(err, "failed to delete Endpoint by Collection")
 
 		ginkgo.By("waiting for Endpoint deletion")
-		for watchEvent := range endpointWatchChan {
-			if watchEvent.Type == "DELETED" {
-				break
+		ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, err = watchtools.Until(ctx, endpoints.ResourceVersion, w, func(event watch.Event) (bool, error) {
+			switch event.Type {
+			case watch.Deleted:
+				if endpoints, ok := event.Object.(*v1.Endpoints); ok {
+					found := endpoints.ObjectMeta.Name == endpoints.Name &&
+						endpoints.Labels["test-endpoint-static"] == "true"
+					return found, nil
+				}
+			default:
+				framework.Logf("observed event type %v", event.Type)
 			}
-		}
+			return false, nil
+		})
+		framework.ExpectNoError(err, "failed to see %v event", watch.Deleted)
+
+		ginkgo.By("fetching the Endpoint")
+		_, err = f.ClientSet.CoreV1().Endpoints(testNamespaceName).Get(context.TODO(), testEndpointName, metav1.GetOptions{})
+		framework.ExpectError(err, "should not be able to fetch Endpoint")
 	})
 })
 
@@ -2885,11 +3030,18 @@ var _ = SIGDescribe("ESIPP [Slow]", func() {
 			framework.ExpectNoError(err)
 
 			// Make sure we didn't leak the health check node port.
-			threshold := 2
-			nodes, err := jig.GetEndpointNodes()
+			const threshold = 2
+			nodes, err := getEndpointNodesWithInternalIP(jig)
 			framework.ExpectNoError(err)
-			for _, ips := range nodes {
-				err := TestHTTPHealthCheckNodePort(ips[0], healthCheckNodePort, "/healthz", e2eservice.KubeProxyEndpointLagTimeout, false, threshold)
+			config := e2enetwork.NewNetworkingTestConfig(f, false, false)
+			for _, internalIP := range nodes {
+				err := testHTTPHealthCheckNodePortFromTestContainer(
+					config,
+					internalIP,
+					healthCheckNodePort,
+					e2eservice.KubeProxyLagTimeout,
+					false,
+					threshold)
 				framework.ExpectNoError(err)
 			}
 			err = cs.CoreV1().Services(svc.Namespace).Delete(context.TODO(), svc.Name, metav1.DeleteOptions{})
@@ -2923,17 +3075,20 @@ var _ = SIGDescribe("ESIPP [Slow]", func() {
 		}()
 
 		tcpNodePort := int(svc.Spec.Ports[0].NodePort)
-		endpointsNodeMap, err := jig.GetEndpointNodes()
-		framework.ExpectNoError(err)
-		path := "/clientip"
 
-		for nodeName, nodeIPs := range endpointsNodeMap {
-			nodeIP := nodeIPs[0]
-			ginkgo.By(fmt.Sprintf("reading clientIP using the TCP service's NodePort, on node %v: %v%v%v", nodeName, nodeIP, tcpNodePort, path))
-			content := GetHTTPContent(nodeIP, tcpNodePort, e2eservice.KubeProxyLagTimeout, path)
-			clientIP := content.String()
-			framework.Logf("ClientIP detected by target pod using NodePort is %s", clientIP)
-			if strings.HasPrefix(clientIP, "10.") {
+		endpointsNodeMap, err := getEndpointNodesWithInternalIP(jig)
+		framework.ExpectNoError(err)
+
+		dialCmd := "clientip"
+		config := e2enetwork.NewNetworkingTestConfig(f, false, false)
+
+		for nodeName, nodeIP := range endpointsNodeMap {
+			ginkgo.By(fmt.Sprintf("reading clientIP using the TCP service's NodePort, on node %v: %v:%v/%v", nodeName, nodeIP, tcpNodePort, dialCmd))
+			clientIP, err := GetHTTPContentFromTestContainer(config, nodeIP, tcpNodePort, e2eservice.KubeProxyLagTimeout, dialCmd)
+			framework.ExpectNoError(err)
+			framework.Logf("ClientIP detected by target pod using NodePort is %s, the ip of test container is %s", clientIP, config.TestContainerPod.Status.PodIP)
+			// the clientIP returned by agnhost contains port
+			if !strings.HasPrefix(clientIP, config.TestContainerPod.Status.PodIP) {
 				framework.Failf("Source IP was NOT preserved")
 			}
 		}
@@ -2970,13 +3125,13 @@ var _ = SIGDescribe("ESIPP [Slow]", func() {
 			framework.Failf("Service HealthCheck NodePort was not allocated")
 		}
 
-		ips := e2enode.CollectAddresses(nodes, v1.NodeExternalIP)
+		ips := e2enode.CollectAddresses(nodes, v1.NodeInternalIP)
 
 		ingressIP := e2eservice.GetIngressPoint(&svc.Status.LoadBalancer.Ingress[0])
 		svcTCPPort := int(svc.Spec.Ports[0].Port)
 
-		threshold := 2
-		path := "/healthz"
+		const threshold = 2
+		config := e2enetwork.NewNetworkingTestConfig(f, false, false)
 		for i := 0; i < len(nodes.Items); i++ {
 			endpointNodeName := nodes.Items[i].Name
 
@@ -2995,15 +3150,21 @@ var _ = SIGDescribe("ESIPP [Slow]", func() {
 
 			// HealthCheck should pass only on the node where num(endpoints) > 0
 			// All other nodes should fail the healthcheck on the service healthCheckNodePort
-			for n, publicIP := range ips {
+			for n, internalIP := range ips {
 				// Make sure the loadbalancer picked up the health check change.
 				// Confirm traffic can reach backend through LB before checking healthcheck nodeport.
 				e2eservice.TestReachableHTTP(ingressIP, svcTCPPort, e2eservice.KubeProxyLagTimeout)
 				expectedSuccess := nodes.Items[n].Name == endpointNodeName
 				port := strconv.Itoa(healthCheckNodePort)
-				ipPort := net.JoinHostPort(publicIP, port)
-				framework.Logf("Health checking %s, http://%s%s, expectedSuccess %v", nodes.Items[n].Name, ipPort, path, expectedSuccess)
-				err := TestHTTPHealthCheckNodePort(publicIP, healthCheckNodePort, path, e2eservice.KubeProxyEndpointLagTimeout, expectedSuccess, threshold)
+				ipPort := net.JoinHostPort(internalIP, port)
+				framework.Logf("Health checking %s, http://%s/healthz, expectedSuccess %v", nodes.Items[n].Name, ipPort, expectedSuccess)
+				err := testHTTPHealthCheckNodePortFromTestContainer(
+					config,
+					internalIP,
+					healthCheckNodePort,
+					e2eservice.KubeProxyEndpointLagTimeout,
+					expectedSuccess,
+					threshold)
 				framework.ExpectNoError(err)
 			}
 			framework.ExpectNoError(e2erc.DeleteRCAndWaitForGC(f.ClientSet, namespace, serviceName))
@@ -3069,8 +3230,7 @@ var _ = SIGDescribe("ESIPP [Slow]", func() {
 		}
 	})
 
-	// TODO: Get rid of [DisabledForLargeClusters] tag when issue #90047 is fixed.
-	ginkgo.It("should handle updates to ExternalTrafficPolicy field [DisabledForLargeClusters]", func() {
+	ginkgo.It("should handle updates to ExternalTrafficPolicy field", func() {
 		namespace := f.Namespace.Name
 		serviceName := "external-local-update"
 		jig := e2eservice.NewTestJig(cs, namespace, serviceName)
@@ -3103,42 +3263,71 @@ var _ = SIGDescribe("ESIPP [Slow]", func() {
 			framework.Failf("Service HealthCheck NodePort still present")
 		}
 
-		endpointNodeMap, err := jig.GetEndpointNodes()
+		epNodes, err := jig.ListNodesWithEndpoint()
 		framework.ExpectNoError(err)
-		noEndpointNodeMap := map[string][]string{}
-		for _, n := range nodes.Items {
-			if _, ok := endpointNodeMap[n.Name]; ok {
-				continue
+		// map from name of nodes with endpoint to internal ip
+		// it is assumed that there is only a single node with the endpoint
+		endpointNodeMap := make(map[string]string)
+		// map from name of nodes without endpoint to internal ip
+		noEndpointNodeMap := make(map[string]string)
+		for _, node := range epNodes {
+			ips := e2enode.GetAddresses(&node, v1.NodeInternalIP)
+			if len(ips) < 1 {
+				framework.Failf("No internal ip found for node %s", node.Name)
 			}
-			noEndpointNodeMap[n.Name] = e2enode.GetAddresses(&n, v1.NodeExternalIP)
+			endpointNodeMap[node.Name] = ips[0]
 		}
+		for _, n := range nodes.Items {
+			ips := e2enode.GetAddresses(&n, v1.NodeInternalIP)
+			if len(ips) < 1 {
+				framework.Failf("No internal ip found for node %s", n.Name)
+			}
+			if _, ok := endpointNodeMap[n.Name]; !ok {
+				noEndpointNodeMap[n.Name] = ips[0]
+			}
+		}
+		framework.ExpectNotEqual(len(endpointNodeMap), 0)
+		framework.ExpectNotEqual(len(noEndpointNodeMap), 0)
 
 		svcTCPPort := int(svc.Spec.Ports[0].Port)
 		svcNodePort := int(svc.Spec.Ports[0].NodePort)
 		ingressIP := e2eservice.GetIngressPoint(&svc.Status.LoadBalancer.Ingress[0])
 		path := "/clientip"
+		dialCmd := "clientip"
+
+		config := e2enetwork.NewNetworkingTestConfig(f, false, false)
 
 		ginkgo.By(fmt.Sprintf("endpoints present on nodes %v, absent on nodes %v", endpointNodeMap, noEndpointNodeMap))
-		for nodeName, nodeIPs := range noEndpointNodeMap {
-			ginkgo.By(fmt.Sprintf("Checking %v (%v:%v%v) proxies to endpoints on another node", nodeName, nodeIPs[0], svcNodePort, path))
-			GetHTTPContent(nodeIPs[0], svcNodePort, e2eservice.KubeProxyLagTimeout, path)
+		for nodeName, nodeIP := range noEndpointNodeMap {
+			ginkgo.By(fmt.Sprintf("Checking %v (%v:%v/%v) proxies to endpoints on another node", nodeName, nodeIP[0], svcNodePort, dialCmd))
+			_, err := GetHTTPContentFromTestContainer(config, nodeIP, svcNodePort, e2eservice.KubeProxyLagTimeout, dialCmd)
+			framework.ExpectNoError(err, "Could not reach HTTP service through %v:%v/%v after %v", nodeIP, svcNodePort, dialCmd, e2eservice.KubeProxyLagTimeout)
 		}
 
-		for nodeName, nodeIPs := range endpointNodeMap {
-			ginkgo.By(fmt.Sprintf("checking kube-proxy health check fails on node with endpoint (%s), public IP %s", nodeName, nodeIPs[0]))
-			var body bytes.Buffer
-			pollfn := func() (bool, error) {
-				result := e2enetwork.PokeHTTP(nodeIPs[0], healthCheckNodePort, "/healthz", nil)
-				if result.Code == 0 {
+		for nodeName, nodeIP := range endpointNodeMap {
+			ginkgo.By(fmt.Sprintf("checking kube-proxy health check fails on node with endpoint (%s), public IP %s", nodeName, nodeIP))
+			var body string
+			pollFn := func() (bool, error) {
+				// we expect connection failure here, but not other errors
+				resp, err := config.GetResponseFromTestContainer(
+					"http",
+					"healthz",
+					nodeIP,
+					healthCheckNodePort)
+				if err != nil {
+					return false, nil
+				}
+				if len(resp.Errors) > 0 {
 					return true, nil
 				}
-				body.Reset()
-				body.Write(result.Body)
+				if len(resp.Responses) > 0 {
+					body = resp.Responses[0]
+				}
 				return false, nil
 			}
-			if pollErr := wait.PollImmediate(framework.Poll, e2eservice.TestTimeout, pollfn); pollErr != nil {
+			if pollErr := wait.PollImmediate(framework.Poll, e2eservice.TestTimeout, pollFn); pollErr != nil {
 				framework.Failf("Kube-proxy still exposing health check on node %v:%v, after ESIPP was turned off. body %s",
-					nodeName, healthCheckNodePort, body.String())
+					nodeName, healthCheckNodePort, body)
 			}
 		}
 
@@ -3569,40 +3758,42 @@ func translatePodNameToUID(c clientset.Interface, ns string, expectedEndpoints p
 // validateEndpointsPorts validates that the given service exists and is served by the given expectedEndpoints.
 func validateEndpointsPorts(c clientset.Interface, namespace, serviceName string, expectedEndpoints portsByPodName) error {
 	ginkgo.By(fmt.Sprintf("waiting up to %v for service %s in namespace %s to expose endpoints %v", framework.ServiceStartTimeout, serviceName, namespace, expectedEndpoints))
-	i := 1
-	for start := time.Now(); time.Since(start) < framework.ServiceStartTimeout; time.Sleep(1 * time.Second) {
+	expectedPortsByPodUID, err := translatePodNameToUID(c, namespace, expectedEndpoints)
+	if err != nil {
+		return err
+	}
+
+	i := 0
+	if pollErr := wait.PollImmediate(time.Second, framework.ServiceStartTimeout, func() (bool, error) {
 		ep, err := c.CoreV1().Endpoints(namespace).Get(context.TODO(), serviceName, metav1.GetOptions{})
 		if err != nil {
-			framework.Logf("Get endpoints failed (%v elapsed, ignoring for 5s): %v", time.Since(start), err)
-			continue
+			framework.Logf("Failed go get Endpoints object: %v", err)
+			// Retry the error
+			return false, nil
 		}
 		portsByPodUID := e2eendpoints.GetContainerPortsByPodUID(ep)
-		expectedPortsByPodUID, err := translatePodNameToUID(c, namespace, expectedEndpoints)
-		if err != nil {
-			return err
-		}
-		if len(portsByPodUID) == len(expectedEndpoints) {
-			err := validatePorts(portsByPodUID, expectedPortsByPodUID)
-			if err != nil {
-				return err
-			}
-			framework.Logf("successfully validated that service %s in namespace %s exposes endpoints %v (%v elapsed)",
-				serviceName, namespace, expectedEndpoints, time.Since(start))
-			return nil
-		}
-		if i%5 == 0 {
-			framework.Logf("Unexpected endpoints: found %v, expected %v (%v elapsed, will retry)", portsByPodUID, expectedEndpoints, time.Since(start))
-		}
+
 		i++
-	}
-	if pods, err := c.CoreV1().Pods(metav1.NamespaceAll).List(context.TODO(), metav1.ListOptions{}); err == nil {
-		for _, pod := range pods.Items {
-			framework.Logf("Pod %s\t%s\t%s\t%s", pod.Namespace, pod.Name, pod.Spec.NodeName, pod.DeletionTimestamp)
+		if err := validatePorts(portsByPodUID, expectedPortsByPodUID); err != nil {
+			if i%5 == 0 {
+				framework.Logf("Unexpected endpoints: found %v, expected %v, will retry", portsByPodUID, expectedEndpoints)
+			}
+			return false, nil
 		}
-	} else {
-		framework.Logf("Can't list pod debug info: %v", err)
+		framework.Logf("successfully validated that service %s in namespace %s exposes endpoints %v",
+			serviceName, namespace, expectedEndpoints)
+		return true, nil
+	}); pollErr != nil {
+		if pods, err := c.CoreV1().Pods(metav1.NamespaceAll).List(context.TODO(), metav1.ListOptions{}); err == nil {
+			for _, pod := range pods.Items {
+				framework.Logf("Pod %s\t%s\t%s\t%s", pod.Namespace, pod.Name, pod.Spec.NodeName, pod.DeletionTimestamp)
+			}
+		} else {
+			framework.Logf("Can't list pod debug info: %v", err)
+		}
+		return fmt.Errorf("error waithing for service %s in namespace %s to expose endpoints %v: %v", serviceName, namespace, expectedEndpoints, pollErr)
 	}
-	return fmt.Errorf("Timed out waiting for service %s in namespace %s to expose endpoints %v (%v elapsed)", serviceName, namespace, expectedEndpoints, framework.ServiceStartTimeout)
+	return nil
 }
 
 // restartApiserver restarts the kube-apiserver.

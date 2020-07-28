@@ -25,6 +25,9 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
+### Hardcoded constants
+METADATA_SERVER_IP="${METADATA_SERVER_IP:-169.254.169.254}"
+
 function convert-manifest-params {
   # A helper function to convert the manifest args from a string to a list of
   # flag arguments.
@@ -96,6 +99,28 @@ function secure_random {
   echo -n "${out}" | xxd -r -p | base64 -w 0
 }
 
+# Helper for configuring iptables rules for metadata server.
+#
+# $1 is the command flag (-I or -D).
+# $2 is the firewall action (LOG or REJECT).
+# $3 is the prefix for log output.
+# $4 is "!" to optionally invert the uid range.
+function gce-metadata-fw-helper {
+  local -r command="$1"
+  local action="$2"
+  local -r prefix="$3"
+  local -r invert="${4:-}"
+
+  # Expand rule action to include relevant option flags.
+  case "${action}" in
+    LOG)
+      action="LOG --log-prefix "${prefix}:" --log-uid --log-tcp-options --log-ip-option"
+      ;;
+  esac
+
+  iptables ${command} OUTPUT -p tcp --dport 80 -d ${METADATA_SERVER_IP} -m owner ${invert:-} --uid-owner=${METADATA_SERVER_ALLOWED_UID_RANGE:-0-2999} -j ${action}
+}
+
 function config-ip-firewall {
   echo "Configuring IP firewall rules"
 
@@ -146,8 +171,17 @@ function config-ip-firewall {
   # node because we don't expect the daemonset to run on this node.
   if [[ "${ENABLE_METADATA_CONCEALMENT:-}" == "true" ]] && [[ ! "${METADATA_CONCEALMENT_NO_FIREWALL:-}" == "true" ]]; then
     echo "Add rule for metadata concealment"
-    iptables -w -t nat -I PREROUTING -p tcp -d 169.254.169.254 --dport 80 -m comment --comment "metadata-concealment: bridge traffic to metadata server goes to metadata proxy" -j DNAT --to-destination 127.0.0.1:988
+    iptables -w -t nat -I PREROUTING -p tcp -d ${METADATA_SERVER_IP} --dport 80 -m comment --comment "metadata-concealment: bridge traffic to metadata server goes to metadata proxy" -j DNAT --to-destination 127.0.0.1:988
   fi
+
+  # Log all metadata access not from approved processes.
+  case "${METADATA_SERVER_FIREWALL_MODE:-off}" in
+    log)
+      echo "Installing metadata firewall logging rules"
+      gce-metadata-fw-helper -I LOG "MetadataServerFirewallReject" !
+      gce-metadata-fw-helper -I LOG "MetadataServerFirewallAccept"
+      ;;
+  esac
 }
 
 function create-dirs {
@@ -879,6 +913,20 @@ EOF
 apiVersion: apiserver.k8s.io/v1alpha1
 kind: AdmissionConfiguration
 plugins:
+EOF
+
+    # Add resourcequota config to limit critical pods to kube-system by default
+    cat <<EOF >>/etc/srv/kubernetes/admission_controller_config.yaml
+- name: "ResourceQuota"
+  configuration:
+    apiVersion: apiserver.config.k8s.io/v1
+    kind: ResourceQuotaConfiguration
+    limitedResources:
+    - resource: pods
+      matchScopes:
+      - scopeName: PriorityClass 
+        operator: In
+        values: ["system-node-critical", "system-cluster-critical"]
 EOF
 
     if [[ "${ADMISSION_CONTROL:-}" == *"ImagePolicyWebhook"* ]]; then
@@ -2494,6 +2542,7 @@ EOF
   if echo "${ADMISSION_CONTROL:-}" | grep -q "LimitRanger"; then
     setup-addon-manifests "admission-controls" "limit-range" "gce"
   fi
+  setup-addon-manifests "addons" "admission-resource-quota-critical-pods"
   if [[ "${NETWORK_POLICY_PROVIDER:-}" == "calico" ]]; then
     setup-addon-manifests "addons" "calico-policy-controller"
 

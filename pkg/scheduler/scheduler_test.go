@@ -33,7 +33,7 @@ import (
 
 	"github.com/google/go-cmp/cmp"
 	v1 "k8s.io/api/core/v1"
-	"k8s.io/api/events/v1beta1"
+	eventsv1 "k8s.io/api/events/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
@@ -55,6 +55,7 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/noderesources"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/queuesort"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/volumebinding"
+	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 	framework "k8s.io/kubernetes/pkg/scheduler/framework/v1alpha1"
 	internalcache "k8s.io/kubernetes/pkg/scheduler/internal/cache"
 	fakecache "k8s.io/kubernetes/pkg/scheduler/internal/cache/fake"
@@ -121,10 +122,10 @@ func (es mockScheduler) Extenders() []framework.Extender {
 }
 
 func TestSchedulerCreation(t *testing.T) {
-	invalidRegistry := map[string]framework.PluginFactory{
+	invalidRegistry := map[string]frameworkruntime.PluginFactory{
 		defaultbinder.Name: defaultbinder.New,
 	}
-	validRegistry := map[string]framework.PluginFactory{
+	validRegistry := map[string]frameworkruntime.PluginFactory{
 		"Foo": defaultbinder.New,
 	}
 	cases := []struct {
@@ -172,7 +173,7 @@ func TestSchedulerCreation(t *testing.T) {
 			client := clientsetfake.NewSimpleClientset()
 			informerFactory := informers.NewSharedInformerFactory(client, 0)
 
-			eventBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: client.EventsV1beta1().Events("")})
+			eventBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: client.EventsV1()})
 
 			stopCh := make(chan struct{})
 			defer close(stopCh)
@@ -208,7 +209,7 @@ func TestSchedulerCreation(t *testing.T) {
 func TestSchedulerScheduleOne(t *testing.T) {
 	testNode := v1.Node{ObjectMeta: metav1.ObjectMeta{Name: "machine1", UID: types.UID("machine1")}}
 	client := clientsetfake.NewSimpleClientset(&testNode)
-	eventBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: client.EventsV1beta1().Events("")})
+	eventBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: client.EventsV1()})
 	errS := errors.New("scheduler")
 	errB := errors.New("binder")
 
@@ -298,7 +299,7 @@ func TestSchedulerScheduleOne(t *testing.T) {
 			fwk, err := st.NewFramework([]st.RegisterPluginFunc{
 				st.RegisterQueueSortPlugin(queuesort.Name, queuesort.New),
 				st.RegisterBindPlugin(defaultbinder.Name, defaultbinder.New),
-			}, framework.WithClientSet(client))
+			}, frameworkruntime.WithClientSet(client))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -318,12 +319,13 @@ func TestSchedulerScheduleOne(t *testing.T) {
 					testSchedulerName: &profile.Profile{
 						Framework: fwk,
 						Recorder:  eventBroadcaster.NewRecorder(scheme.Scheme, testSchedulerName),
+						Name:      testSchedulerName,
 					},
 				},
 			}
 			called := make(chan struct{})
 			stopFunc := eventBroadcaster.StartEventWatcher(func(obj runtime.Object) {
-				e, _ := obj.(*v1beta1.Event)
+				e, _ := obj.(*eventsv1.Event)
 				if e.Reason != item.eventReason {
 					t.Errorf("got event %v, want %v", e.Reason, item.eventReason)
 				}
@@ -361,7 +363,7 @@ type fakeNodeSelector struct {
 
 func newFakeNodeSelector(args runtime.Object, _ framework.FrameworkHandle) (framework.Plugin, error) {
 	pl := &fakeNodeSelector{}
-	if err := framework.DecodeInto(args, &pl.fakeNodeSelectorArgs); err != nil {
+	if err := frameworkruntime.DecodeInto(args, &pl.fakeNodeSelectorArgs); err != nil {
 		return nil, err
 	}
 	return pl, nil
@@ -407,7 +409,7 @@ func TestSchedulerMultipleProfilesScheduling(t *testing.T) {
 	// We use a fake filter that only allows one particular node. We create two
 	// profiles, each with a different node in the filter configuration.
 	client := clientsetfake.NewSimpleClientset(nodes...)
-	broadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: client.EventsV1beta1().Events("")})
+	broadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: client.EventsV1()})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -444,7 +446,7 @@ func TestSchedulerMultipleProfilesScheduling(t *testing.T) {
 				},
 			},
 		),
-		WithFrameworkOutOfTreeRegistry(framework.Registry{
+		WithFrameworkOutOfTreeRegistry(frameworkruntime.Registry{
 			"FakeNodeSelector": newFakeNodeSelector,
 		}),
 	)
@@ -467,7 +469,7 @@ func TestSchedulerMultipleProfilesScheduling(t *testing.T) {
 	})
 	controllers := make(map[string]string)
 	stopFn := broadcaster.StartEventWatcher(func(obj runtime.Object) {
-		e, ok := obj.(*v1beta1.Event)
+		e, ok := obj.(*eventsv1.Event)
 		if !ok || e.Reason != "Scheduled" {
 			return
 		}
@@ -765,10 +767,11 @@ func setupTestScheduler(queuedPodStore *clientcache.FIFO, scache internalcache.C
 		return true, b, nil
 	})
 
-	fwk, _ := st.NewFramework(fns, framework.WithClientSet(client))
+	fwk, _ := st.NewFramework(fns, frameworkruntime.WithClientSet(client), frameworkruntime.WithPodNominator(internalqueue.NewPodNominator()))
 	prof := &profile.Profile{
 		Framework: fwk,
 		Recorder:  &events.FakeRecorder{},
+		Name:      testSchedulerName,
 	}
 	if broadcaster != nil {
 		prof.Recorder = broadcaster.NewRecorder(scheme.Scheme, testSchedulerName)
@@ -779,7 +782,6 @@ func setupTestScheduler(queuedPodStore *clientcache.FIFO, scache internalcache.C
 
 	algo := core.NewGenericScheduler(
 		scache,
-		internalqueue.NewSchedulingQueue(nil),
 		internalcache.NewEmptySnapshot(),
 		[]framework.Extender{},
 		informerFactory.Core().V1().PersistentVolumeClaims().Lister(),
@@ -823,7 +825,7 @@ func setupTestSchedulerWithVolumeBinding(volumeBinder scheduling.SchedulerVolume
 		st.RegisterBindPlugin(defaultbinder.Name, defaultbinder.New),
 		st.RegisterPluginAsExtensions(volumebinding.Name, func(plArgs runtime.Object, handle framework.FrameworkHandle) (framework.Plugin, error) {
 			return &volumebinding.VolumeBinding{Binder: volumeBinder}, nil
-		}, "PreFilter", "Filter", "Reserve", "Unreserve", "PreBind", "PostBind"),
+		}, "PreFilter", "Filter", "Reserve", "PreBind"),
 	}
 	s, bindingChan, errChan := setupTestScheduler(queuedPodStore, scache, informerFactory, broadcaster, fns...)
 	informerFactory.Start(stop)
@@ -845,7 +847,7 @@ func TestSchedulerWithVolumeBinding(t *testing.T) {
 	bindErr := fmt.Errorf("bind err")
 	client := clientsetfake.NewSimpleClientset()
 
-	eventBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: client.EventsV1beta1().Events("")})
+	eventBroadcaster := events.NewBroadcaster(&events.EventSinkImpl{Interface: client.EventsV1()})
 
 	// This can be small because we wait for pod to finish scheduling first
 	chanTimeout := 2 * time.Second
@@ -916,7 +918,7 @@ func TestSchedulerWithVolumeBinding(t *testing.T) {
 			},
 			expectAssumeCalled: true,
 			eventReason:        "FailedScheduling",
-			expectError:        fmt.Errorf("error while running %q reserve plugin for pod %q: %v", volumebinding.Name, "foo", assumeErr),
+			expectError:        fmt.Errorf("error while running Reserve in %q reserve plugin for pod %q: %v", volumebinding.Name, "foo", assumeErr),
 		},
 		{
 			name: "bind error",
@@ -937,7 +939,7 @@ func TestSchedulerWithVolumeBinding(t *testing.T) {
 			s, bindingChan, errChan := setupTestSchedulerWithVolumeBinding(fakeVolumeBinder, stop, eventBroadcaster)
 			eventChan := make(chan struct{})
 			stopFunc := eventBroadcaster.StartEventWatcher(func(obj runtime.Object) {
-				e, _ := obj.(*v1beta1.Event)
+				e, _ := obj.(*eventsv1.Event)
 				if e, a := item.eventReason, e.Reason; e != a {
 					t.Errorf("expected %v, got %v", e, a)
 				}
@@ -1118,7 +1120,7 @@ func TestSchedulerBinding(t *testing.T) {
 			fwk, err := st.NewFramework([]st.RegisterPluginFunc{
 				st.RegisterQueueSortPlugin(queuesort.Name, queuesort.New),
 				st.RegisterBindPlugin(defaultbinder.Name, defaultbinder.New),
-			}, framework.WithClientSet(client))
+			}, frameworkruntime.WithClientSet(client))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1131,7 +1133,6 @@ func TestSchedulerBinding(t *testing.T) {
 			scache := internalcache.New(100*time.Millisecond, stop)
 			algo := core.NewGenericScheduler(
 				scache,
-				nil,
 				nil,
 				test.extenders,
 				nil,

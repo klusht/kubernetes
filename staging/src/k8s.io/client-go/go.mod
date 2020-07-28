@@ -2,7 +2,7 @@
 
 module k8s.io/client-go
 
-go 1.13
+go 1.15
 
 require (
 	cloud.google.com/go v0.51.0 // indirect
@@ -22,20 +22,18 @@ require (
 	github.com/peterbourgon/diskv v2.0.1+incompatible
 	github.com/spf13/pflag v1.0.5
 	github.com/stretchr/testify v1.4.0
-	golang.org/x/crypto v0.0.0-20200220183623-bac4c82f6975
-	golang.org/x/net v0.0.0-20200324143707-d3edc9973b7e
+	golang.org/x/crypto v0.0.0-20200622213623-75b288015ac9
+	golang.org/x/net v0.0.0-20200707034311-ab3426394381
 	golang.org/x/oauth2 v0.0.0-20191202225959-858c2ad4c8b6
 	golang.org/x/time v0.0.0-20191024005414-555d28b269f0
 	k8s.io/api v0.0.0
 	k8s.io/apimachinery v0.0.0
-	k8s.io/klog/v2 v2.1.0
-	k8s.io/utils v0.0.0-20200414100711-2df71ebbae66
+	k8s.io/klog/v2 v2.2.0
+	k8s.io/utils v0.0.0-20200720150651-0bdb4ca86cbc
 	sigs.k8s.io/yaml v1.2.0
 )
 
 replace (
-	golang.org/x/sys => golang.org/x/sys v0.0.0-20190813064441-fde4db37ae7a // pinned to release-branch.go1.13
-	golang.org/x/tools => golang.org/x/tools v0.0.0-20190821162956-65e3620a7ae7 // pinned to release-branch.go1.13
 	k8s.io/api => ../api
 	k8s.io/apimachinery => ../apimachinery
 	k8s.io/client-go => ../client-go
